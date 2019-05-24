@@ -89,6 +89,7 @@
 -- @wreq@. The only difference is the API.
 
 {-# LANGUAGE BangPatterns               #-}
+{-# LANGUAGE CPP                        #-}
 {-# LANGUAGE DataKinds                  #-}
 {-# LANGUAGE DeriveDataTypeable         #-}
 {-# LANGUAGE DeriveGeneric              #-}
@@ -101,8 +102,14 @@
 {-# LANGUAGE RecordWildCards            #-}
 {-# LANGUAGE ScopedTypeVariables        #-}
 {-# LANGUAGE TypeFamilies               #-}
+
+#if MIN_VERSION_base(4,9,0)
 {-# LANGUAGE UndecidableInstances       #-}
+#endif
+
+#if __GLASGOW_HASKELL__ >= 800
 {-# OPTIONS_GHC -fno-warn-redundant-constraints #-}
+#endif
 
 module Network.HTTP.Req
   ( -- * Making a request
@@ -205,14 +212,15 @@ module Network.HTTP.Req
     -- * Other
   , HttpException (..)
   , CanHaveBody (..)
-  , Scheme (..) )
+  , Scheme (..)
+  , globalManager )
 where
 
 import Control.Applicative
 import Control.Arrow (first, second)
-import Control.Exception hiding (TypeError)
 import Control.Monad.Base
 import Control.Monad.IO.Class
+import Control.Monad.IO.Unlift
 import Control.Monad.Reader
 import Control.Monad.Trans.Control
 import Control.Retry
@@ -221,7 +229,6 @@ import Data.ByteString (ByteString)
 import Data.Data (Data)
 import Data.Function (on)
 import Data.IORef
-import Data.Kind (Constraint)
 import Data.List (nubBy)
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.Maybe (fromMaybe)
@@ -249,6 +256,14 @@ import qualified Network.HTTP.Client.MultipartFormData as LM
 import qualified Network.HTTP.Client.TLS      as L
 import qualified Network.HTTP.Types           as Y
 import qualified Web.Authenticate.OAuth       as OAuth
+
+#if MIN_VERSION_base(4,9,0)
+import UnliftIO.Exception hiding (TypeError)
+import Data.Kind (Constraint)
+#else
+import UnliftIO.Exception
+import GHC.Exts (Constraint)
+#endif
 
 ----------------------------------------------------------------------------
 -- Making a request
@@ -298,7 +313,6 @@ import qualified Web.Authenticate.OAuth       as OAuth
 -- First, this is a piece of boilerplate that should be in place before you
 -- try the examples:
 --
--- > {-# LANGUAGE DeriveGeneric     #-}
 -- > {-# LANGUAGE OverloadedStrings #-}
 -- >
 -- > module Main (main) where
@@ -409,7 +423,7 @@ reqBr
   -> Url scheme        -- ^ 'Url'—location of resource
   -> body              -- ^ Body of the request
   -> Option scheme     -- ^ Collection of optional parameters
-  -> (L.Response L.BodyReader -> IO a) -- ^ How to consume response
+  -> (L.Response L.BodyReader -> m a) -- ^ How to consume response
   -> m a               -- ^ Result
 reqBr method url body options consume = req' method url body options $ \request manager -> do
   HttpConfig {..}  <- getHttpConfig
@@ -418,7 +432,7 @@ reqBr method url body options consume = req' method url body options $ \request 
       withRRef    = bracket
         (newIORef Nothing)
         (readIORef >=> mapM_ L.responseClose)
-  (liftIO . try . wrapVanilla . wrapExc) (withRRef $ \rref -> do
+  (try . wrapVanilla . wrapExc) (withRunInIO $ \inIO -> withRRef $ \rref -> do
     let openResponse = mask_ $ do
           r  <- readIORef rref
           mapM_ L.responseClose r
@@ -431,7 +445,7 @@ reqBr method url body options consume = req' method url body options $ \request 
       (const openResponse)
     (preview, r') <- grabPreview bodyPreviewLength r
     mapM_ LI.throwHttp (httpConfigCheckResponse request r' preview)
-    consume r')
+    inIO $! consume r')
     >>= either handleHttpException return
 
 -- | Mostly like 'req' with respect to its arguments, but accepts a callback
@@ -524,7 +538,7 @@ globalManager = unsafePerformIO $ do
 -- Typically, you only need to define the 'handleHttpException' method
 -- unless you want to tweak 'HttpConfig'.
 
-class MonadIO m => MonadHttp m where
+class MonadUnliftIO m => MonadHttp m where
 
   -- | This method describes how to deal with 'HttpException' that was
   -- caught by the library. One option is to re-throw it if you are OK with
@@ -647,7 +661,8 @@ newtype Req a = Req (ReaderT HttpConfig IO a)
   deriving ( Functor
            , Applicative
            , Monad
-           , MonadIO )
+           , MonadIO
+           , MonadUnliftIO )
 
 instance MonadBase IO Req where
   liftBase = liftIO
@@ -1096,8 +1111,10 @@ type family HttpBodyAllowed
   (providesBody :: CanHaveBody) :: Constraint where
   HttpBodyAllowed 'NoBody      'NoBody = ()
   HttpBodyAllowed 'CanHaveBody body    = ()
+#if MIN_VERSION_base(4,9,0)
   HttpBodyAllowed 'NoBody 'CanHaveBody = TypeError
     ('Text "This HTTP method does not allow attaching a request body.")
+#endif
 
 instance HttpBody body => RequestComponent (Womb "body" body) where
   getRequestMod (Womb body) = Endo $ \x ->
@@ -1435,7 +1452,7 @@ newtype JsonResponse a = JsonResponse (L.Response a)
 instance FromJSON a => HttpResponse (JsonResponse a) where
   type HttpResponseBody (JsonResponse a) = a
   toVanillaResponse (JsonResponse r) = r
-  getHttpResponse r = do
+  getHttpResponse r = liftIO $ do
     chunks <- L.brConsume (L.responseBody r)
     case A.eitherDecode (BL.fromChunks chunks) of
       Left  e -> throwIO (JsonHttpException e)
@@ -1455,7 +1472,7 @@ newtype BsResponse = BsResponse (L.Response ByteString)
 instance HttpResponse BsResponse where
   type HttpResponseBody BsResponse = ByteString
   toVanillaResponse (BsResponse r) = r
-  getHttpResponse r = do
+  getHttpResponse r = liftIO $ do
     chunks <- L.brConsume (L.responseBody r)
     return $ BsResponse (B.concat chunks <$ r)
 
@@ -1473,7 +1490,7 @@ newtype LbsResponse = LbsResponse (L.Response BL.ByteString)
 instance HttpResponse LbsResponse where
   type HttpResponseBody LbsResponse = BL.ByteString
   toVanillaResponse (LbsResponse r) = r
-  getHttpResponse r = do
+  getHttpResponse r = liftIO $ do
     chunks <- L.brConsume (L.responseBody r)
     return $ LbsResponse (BL.fromChunks chunks <$ r)
 
@@ -1634,7 +1651,7 @@ class HttpResponse response where
   getHttpResponse
     :: L.Response L.BodyReader
        -- ^ Response with body reader inside
-    -> IO response
+    -> MonadIO m => m response
        -- ^ The final result
 
 ----------------------------------------------------------------------------
